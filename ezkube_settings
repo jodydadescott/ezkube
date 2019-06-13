@@ -1,0 +1,10 @@
+export EZKUBE_CONFIG_BASE=$HOME/.ezkube
+export EZKUBE_AWS_REGION="us-east-1"
+export EZKUBE_AWS_AVAILABILITY_ZONE="a"
+export EZKUBE_VER="1.9.11"
+export EZKUBE_MASTER_SIZE="t2.medium"
+export EZKUBE_NODE_SIZE="t2.medium"
+export EZKUBE_NODE_COUNT="2"
+export EZKUBE_DNS_DOMAIN="jodyscott.us"
+export EZKUBE_SSH_KEY=$HOME/.ssh/id_rsa.pub
+export EZKUBE_IMAGE="309956199498/RHEL-7.6_HVM_GA-20190128-x86_64-0-Hourly2-GP2"

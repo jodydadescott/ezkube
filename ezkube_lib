@@ -1,0 +1,209 @@
+#!/bin/bash
+################################################################################
+# set -x
+################################################################################
+
+KUBECTL_WAIT=60
+
+################################################################################
+
+function ezkube_load() {
+    [[ $1 ]] || { err "Usage: ezkube_load name"; return 2; }
+    export KUBECONFIG=$HOME/.ezkube/$1/kube.config
+}
+
+function ezkube_create() {
+    [[ $1 ]] || { err "Usage: ezkube_create name"; return 2; }
+    EZKUBE_CLUSTER_NAME=$1
+    ezkube_sanity_check || return $?
+    [[ $EZKUBE_CONFIG_BASE ]] || { err "Missing required var EZKUBE_CONFIG_BASE"; return 3; }
+    [[ $EZKUBE_SSH_KEY ]] || { err "Missing required var EZKUBE_SSH_KEY"; return 3; }
+    [[ $EZKUBE_MASTER_SIZE ]] || { err "Missing required var EZKUBE_MASTER_SIZE"; return 3; }
+    [[ $EZKUBE_NODE_SIZE ]] || { err "Missing required var EZKUBE_NODE_SIZE"; return 3; }
+    [[ $EZKUBE_NODE_COUNT ]] || { err "Missing required var EZKUBE_NODE_COUNT"; return 3; }
+    [[ $EZKUBE_DNS_DOMAIN ]] || { err "Missing required var EZKUBE_DNS_DOMAIN"; return 3; }
+    [[ $EZKUBE_AWS_REGION ]] || { err "Missing required var EZKUBE_AWS_REGION"; return 3; }
+    [[ $EZKUBE_AWS_AVAILABILITY_ZONE ]] || { err "Missing required var EZKUBE_AWS_AVAILABILITY_ZONE"; return 3; }
+    [[ $EZKUBE_IMAGE ]] || { err "Missing required var EZKUBE_IMAGE"; return 3; }
+    KUBECONFIG=$HOME/.ezkube/$EZKUBE_CLUSTER_NAME/kube.config
+
+    [ -d ${EZKUBE_CONFIG_BASE}/${EZKUBE_CLUSTER_NAME} ] && {
+        err "Updating cluster $EZKUBE_CLUSTER_NAME"
+        main_msg="Cluster updated"
+    } || {
+        err "Creating cluster $EZKUBE_CLUSTER_NAME"
+        mkdir -p ${EZKUBE_CONFIG_BASE}/${EZKUBE_CLUSTER_NAME}
+        main_msg="Cluster created"
+    }
+   err $main_msg
+   _ezkube_aws_kops_create || return 5
+   _ezkube_aws_patch || return 6
+   _ezkube_kubectl_setup || return 7
+}
+
+function ezkube_delete() {
+    [[ $1 ]] || { err "Usage: ezkube_delete name"; return 2; }
+    EZKUBE_CLUSTER_NAME=$1
+    ezkube_sanity_check || return $?
+    export KUBECONFIG=${EZKUBE_CONFIG_BASE}/${EZKUBE_CLUSTER_NAME}/kube.config
+
+    local ok=0
+    err "Deleting Kubernetes cluster $EZKUBE_CLUSTER_NAME"
+    _ezkube_aws_kops_delete || ok=1
+    [ $ok -eq 1 ] && {
+        err "Kubernetes cluster delete failed"
+        return 3
+    }
+    rm -rf ${EZKUBE_CONFIG_BASE}/${EZKUBE_CLUSTER_NAME} 
+    err "Kubernetes cluster deleted successfully"
+}
+
+
+function ezkube_sanity_check() {
+    which kubectl > /dev/null 2>&1 || { err "Fail: kubectl not in path"; return 3; }
+    which aws > /dev/null 2>&1 || { err "Fail: aws not in path"; return 3; }
+    which kops > /dev/null 2>&1 || { err "Fail: kops not in path"; return 3; }
+    which curl > /dev/null 2>&1 || { err "Fail: curl not in path"; return 3; }
+}
+
+################################################################################
+
+function _ezkube_aws_kops_create() {
+
+    err "AWS KOPS Cluster setup"
+    [ -f ${EZKUBE_CONFIG_BASE}/${EZKUBE_CLUSTER_NAME}/kube.config ] && { err "Complete (prior)"; return 0; }
+
+    err "Creating Kubernetes cluster @ AWS"
+
+    local fqdn=${EZKUBE_CLUSTER_NAME}.${EZKUBE_DNS_DOMAIN}
+    local bucket="s3://${fqdn}"
+    local zones="${EZKUBE_AWS_REGION}${EZKUBE_AWS_AVAILABILITY_ZONE}"
+
+    mkdir -p ${EZKUBE_CONFIG_BASE}/${EZKUBE_CLUSTER_NAME}
+
+    aws s3 ls $bucket > /dev/null 2>&1 && {
+        err "S3 bucket $bucket already exist!";
+    } || {
+        err "Running the aws s3 mb command"
+        aws s3 mb $bucket || { err "Fatal: See above"; return $?; }
+    }
+
+    local cmd="kops "
+    cmd+=" create cluster --image $EZKUBE_IMAGE --name $fqdn --zones=$zones --master-size=$EZKUBE_MASTER_SIZE"
+    cmd+=" --node-size=$EZKUBE_NODE_SIZE --node-count=$EZKUBE_NODE_COUNT --state=$bucket"
+    cmd+=" --ssh-public-key=$EZKUBE_SSH_KEY"
+    [[ $EZKUBE_VER ]] && cmd+=" --kubernetes-version $EZKUBE_VER"
+    cmd+=" --yes"
+    err "Running commnad $cmd"
+    eval $cmd || { err "Fatal (fatal): See above"; return $?; }
+    kops export kubecfg $fqdn --state=$bucket
+    err "Complete"
+    return 0
+}
+
+function _ezkube_aws_patch() {
+    err "AWS Patch"
+    [ -f ${EZKUBE_CONFIG_BASE}/${EZKUBE_CLUSTER_NAME}/.awspatch ] && { err "Complete (prior)"; return 0; }
+    local fqdn=${EZKUBE_CLUSTER_NAME}.${EZKUBE_DNS_DOMAIN}
+    local file=$(mktemp)
+    _ezkube_write_patch $file
+    local cmd="aws"
+    cmd+=" iam put-role-policy --role-name masters.${fqdn}"
+    cmd+=" --policy-name masters19.${fqdn}"
+    cmd+="  --policy-document file://${file}"
+    err "Applying NLB fix"
+    err "Running commnad $cmd"
+    eval $cmd || { err "Fatal (fatal): See above"; }
+    touch ${EZKUBE_CONFIG_BASE}/${EZKUBE_CLUSTER_NAME}/.awspatch
+    err "Complete"
+    rm -rf $file
+    return 0
+}
+
+function _ezkube_aws_kops_delete() {
+    err "AWS KOPS Cluster delete"
+    [ -f ${EZKUBE_CONFIG_BASE}/${EZKUBE_CLUSTER_NAME}/.kops ] || { err "Complete (prior)"; return 0; }
+    err "Deleting Kubernetes cluster @ AWS"
+
+    local fqdn=${EZKUBE_CLUSTER_NAME}.${EZKUBE_DNS_DOMAIN}
+    local bucket="s3://${fqdn}"
+    local zones="${EZKUBE_AWS_REGION}${EZKUBE_AWS_AVAILABILITY_ZONE}"
+
+    local cmd="kops"
+    cmd+=" delete cluster $fqdn --state=$bucket --yes"
+    err "Running commnad $cmd"
+    eval $cmd || { err "Fatal (fatal): See above"; return $?; }
+    rm -rf ${EZKUBE_CONFIG_BASE}/${EZKUBE_CLUSTER_NAME}/.kops
+    err "Kubernetes cluster deleted successfully @ AWS"
+}
+
+function _ezkube_waitfor() {
+    time=$1
+    local counter=$time
+    while true; do
+        counter=$[$counter-1]
+        echo -ne "$counter\033[0K\r"
+        [ $counter -le 0 ] && break
+        sleep 1
+    done
+} 
+
+function _ezkube_kubectl_setup() {
+    err "Kubectl setup"
+    [ -f ${EZKUBE_CONFIG_BASE}/${EZKUBE_CLUSTER_NAME}/.kubesetup ] && { err "Complete (prior)"; return 0; }
+    [ -f ${EZKUBE_CONFIG_BASE}/${EZKUBE_CLUSTER_NAME}/.waitfor ] || {
+        _ezkube_waitfor $KUBECTL_WAIT
+        touch ${EZKUBE_CONFIG_BASE}/${EZKUBE_CLUSTER_NAME}/.waitfor
+    }
+    err "We will try to apply the config to the cluster."
+    err "The cluster might not be online so we will keep trying."
+    local counter=0
+    while true; do
+        err "Try $counter"
+        kubectl get nodes && {
+            err "Cluster responded"
+            break;
+        }
+        counter=$[$counter+1]
+        sleep 1
+    done
+
+    err "Applying configs"
+
+    touch ${EZKUBE_CONFIG_BASE}/${EZKUBE_CLUSTER_NAME}/.kubesetup
+    err "Complete"
+}
+
+function _ezkube_write_patch()
+{
+cat << EOF > $1
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "kopsK8sNLBMasterPermsRestrictive",
+            "Effect": "Allow",
+            "Action": [
+                "ec2:DescribeVpcs",
+                "elasticloadbalancing:AddTags",
+                "elasticloadbalancing:CreateListener",
+                "elasticloadbalancing:CreateTargetGroup",
+                "elasticloadbalancing:DeleteListener",
+                "elasticloadbalancing:DeleteTargetGroup",
+                "elasticloadbalancing:DescribeListeners",
+                "elasticloadbalancing:DescribeLoadBalancerPolicies",
+                "elasticloadbalancing:DescribeTargetGroups",
+                "elasticloadbalancing:DescribeTargetHealth",
+                "elasticloadbalancing:ModifyListener",
+                "elasticloadbalancing:ModifyTargetGroup",
+                "elasticloadbalancing:RegisterTargets",
+                "elasticloadbalancing:SetLoadBalancerPoliciesOfListener"
+            ],
+            "Resource": [
+                "*"
+            ]
+        }
+    ]
+}
+EOF
+}
